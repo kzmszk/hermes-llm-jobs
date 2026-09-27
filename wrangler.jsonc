@@ -1,0 +1,10 @@
+{
+ "$schema":"node_modules/wrangler/config-schema.json",
+ "name":"hermes-llm-jobs",
+ "account_id":"33b65ca225d06f52f72ac3c4b997ec4a",
+ "main":"worker.js",
+ "compatibility_date":"2026-09-26",
+ "workers_dev":true,
+ "d1_databases":[{"binding":"DB","database_name":"hermes-llm-jobs","database_id":"edd419be-8fea-4b14-95b9-04f718fe9353","migrations_dir":"migrations"}],
+ "triggers":{"crons":["23 3 * * *"]}
+}
