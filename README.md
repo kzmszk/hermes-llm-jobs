@@ -49,8 +49,19 @@ python3 provision-app.py my-app --types document.summarize
 |---|---|---|
 | quiz.grade / v1 | question, modelAnswer, rubric（3項目）, answer | criteria（各0〜2点と理由）, confidence, feedback |
 | document.summarize / v1 | text（最大12,000文字） | summary, keyPoints |
+| illustration.svg / v1 | subject（最大60文字、記号 `<>{}` などなし） | svg（線画のSVG、24,000文字まで）, memo（描き手の設計メモ、任意） |
 
 HTTP本文は最大32KiBです。採点基準の文字列などにも個別上限があります。APIの入力・結果形式を `worker.js`、Hermesへの指示・結果検証を `runner.py` で管理しています。任意のコマンド・URL・プロンプトをイベント入力で実行する機能はありません。
+
+## イラスト（illustration.svg）
+
+題材のことばから、プロンプト [prompts/illustration-v3.md](prompts/illustration-v3.md) で線画のSVGを1枚描きます。スケッチブック（demos の sketchbook）の「おためし」ページが使っています。
+
+- 実行は別レーンです。`runner.py --illustration` が専用のロック（`.private/runner-illustration.lock`）と結果ファイル（`.private/illustration-result-*.json`）で1回に1件だけ処理し、採点・要約を待たせません。Hermes の cron に別のジョブとして登録します。
+- 描くのは Opus（`claude-opus-5-5`）です。runner がこのPCの Claude Code CLI を `claude -p --tools "" --no-session-persistence` で直接呼びます（ツールなし、空の作業ディレクトリ、HOME/PATH/LANG だけの環境）。CLI に一度 `/login` しておく必要があります。Luna は経由しません。
+- 題材は訪問者が入力した信頼できない文字列として、固定のプロンプトに差し込むだけです。結果のSVGは [svgclean.py](svgclean.py) の許可リスト（要素・属性・`url(#id)` のみ）で作り直し、先頭のコメントを memo として切り出します。Worker でも最後に危険な記述がないか確かめます。
+- 処理権の期限は1,200秒（ほかは600秒）、Claude の呼び出しは600秒で打ち切ります。1アプリあたり1日30件まで（UTC日、日本時間9時に戻る）。同じ重複防止キーの再送は数えません。
+- 1枚あたり3分ほど、Claude の利用枠を使います（API換算で0.4ドル前後）。
 
 ## 新しい処理の種類を追加する手順
 
