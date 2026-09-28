@@ -12,10 +12,14 @@ flowchart LR
   Quiz[クイズWorkerと専用DB] -->|依頼を登録・結果を取得| API[共通ジョブWorker]
   Other[他アプリのWorker] -->|依頼を登録・結果を取得| API
   API <--> DB[(共通ジョブ専用D1)]
-  Cron[Hermes cron / 5分ごと] -->|未処理を確保| API
-  Cron --> Agent[Hermes / GPT-6 Luna]
-  Agent --> Cron
-  Cron -->|結果保存| API
+  Cron[Hermes cron / 3分ごと] --> Tick[dispatcher.py tick]
+  Tick -->|最大1件を確保| API
+  Tick --> Local[(PC SQLite / jobs + outbox)]
+  Tick --> Common[独立 common worker / Hermes / GPT-6 Luna]
+  Tick --> Art[独立 illustration worker / Claude Code / Opus]
+  Common --> Local
+  Art --> Local
+  Local -->|保存済み結果を再送| API
 ```
 
 ## アプリから使う
@@ -57,7 +61,7 @@ HTTP本文は最大32KiBです。採点基準の文字列などにも個別上�
 
 題材のことばから、プロンプト [prompts/illustration-v3.md](prompts/illustration-v3.md) で線画のSVGを1枚描きます。スケッチブック（demos の sketchbook）の「おためし」ページが使っています。
 
-- 実行は別レーンです。`runner.py --illustration` が専用のロック（`.private/runner-illustration.lock`）と結果ファイル（`.private/illustration-result-*.json`）で1回に1件だけ処理し、採点・要約を待たせません。Hermes の cron に別のジョブとして登録します。
+- 実行は別レーンです。`dispatcher.py tick` が確保してSQLiteに保存したあと、`worker --lane illustration` を独立プロセスで起動します。common workerと別のファイルロックを持ち、採点・要約を待たせません。取得cronは共通の1本だけです。旧 `runner.py --illustration` は移行・ロールバック用に変更せず残しています。
 - 描くのは Opus（`claude-opus-5-5`）です。runner がこのPCの Claude Code CLI を `claude -p --tools "" --no-session-persistence` で直接呼びます（ツールなし、空の作業ディレクトリ、HOME/PATH/LANG だけの環境）。CLI に一度 `/login` しておく必要があります。Luna は経由しません。
 - 題材は訪問者が入力した信頼できない文字列として、固定のプロンプトに差し込むだけです。結果のSVGは [svgclean.py](svgclean.py) の許可リスト（要素・属性・`url(#id)` のみ）で作り直し、先頭のコメントを memo として切り出します。Worker でも最後に危険な記述がないか確かめます。
 - 処理権の期限は1,200秒（ほかは600秒）、Claude の呼び出しは600秒で打ち切ります。1アプリあたり1日30件まで（UTC日、日本時間9時に戻る）。同じ重複防止キーの再送は数えません。
@@ -196,7 +200,7 @@ hermes cron resume 6df0ad98fae9
 
 停止前に起動済みのrunnerは、その処理が終了するまで待ってから編集します。停止中もAPIへの登録はでき、未処理ジョブはDBに残ります。デプロイに失敗した場合は、新しい種類を取得するrunnerをそのまま再開せず、Workerとの対応を揃えてください。
 
-Hermes cronは毎回このディレクトリの `runner.py` を起動するため、次回実行から変更が読み込まれます。新しい処理のために別の定期ジョブを作る必要はありません。別PCで実行する場合は、そのPCにも同じ変更を配布します。
+Hermes cronは毎回このディレクトリの `dispatcher.py tick` を起動し、独立workerが `runner.py` のモデル関数を利用します。次のworkerから変更が読み込まれます。新しい処理のために別の定期ジョブを作る必要はありません。別PCで実行する場合は、そのPCにも同じ変更を配布します。
 
 ### 6. 利用するアプリに許可する
 
@@ -256,7 +260,7 @@ if (job.status === 'completed') {
 // pending / running の間は、後で再取得する
 ```
 
-新しい種類を追加した後の動作確認では、短い文章を1件登録し、`completed` と期待する結果形式を確認します。実際にHermesを呼ぶため、サブスクの利用枠を消費します。日本時間8:00〜23:59にPCとHermesが起動していれば、通常は次の5分間隔の取得後に処理されます。混雑や再試行によって待ち時間は延びます。
+新しい種類を追加した後の動作確認では、短い文章を1件登録し、`completed` と期待する結果形式を確認します。実際にHermesを呼ぶため、サブスクの利用枠を消費します。日本時間8:00〜23:59にPCとHermesが起動していれば、通常は次の3分間隔の取得後に処理されます。混雑や再試行によって待ち時間は延びます。
 
 | 症状 | 確認する場所 |
 |---|---|
@@ -290,33 +294,73 @@ npm run deploy
 - `/health`: サービス識別用の公開ヘルス応答。
 - 元のクイズURLの `/api/jobs` は廃止。認証情報を別URLへ転送するリダイレクトは行いません。
 
-## PC側の実行
+## PC側の実行（SQLite dispatcher）
 
-`.private/config.json` を所有者限定権限で作成します。
+Python標準ライブラリとLinuxの `/usr/bin/timeout` を使用します。追加のPythonパッケージは不要です。このPCのuutils coreutils 0.8.0でもwatchdog動作をテストしています。モデル環境（Hermes、Codexログイン、Claude Codeログイン）は従来と同じです。
+
+`.private/config.json` を所有者限定権限で作成します（既存ファイルをそのまま使用）。キーをコマンドラインやログへ出しません。
 
 ```json
 {"url":"https://hermes-llm-jobs.kazumasa.workers.dev","runnerKey":"Worker Secretと同じ値"}
 ```
 
 ```bash
-python3 runner.py
+cd /home/kazu/work/hermes-llm-jobs
+python3 dispatcher.py tick
+python3 dispatcher.py status
+# 通常はtickが起動。手動の再開・診断時にも同じロックを使用する
+python3 dispatcher.py worker --lane illustration
+python3 dispatcher.py worker --lane common
 ```
 
-日本時間8:00〜23:59のみ実行し、未処理がなければ無出力で終了してLLMを呼びません。1回最大2件、1件150秒まで。PC内の同時実行はファイルロック、PC間はAPIの10分の処理権で制御します。失敗は5分後に再試行し、3回失敗で `failed` にします。
+全サブコマンドに `--state-dir /absolute/private/directory` と `--config /absolute/config.json` を指定できます。既定は `.private/dispatcher` と `.private/config.json`。同一PCの全tick/workerで**同じstate-dir**を使用してください。`status` はAPIや設定ファイルを読みません。`--allow-loopback` は明示的なテスト用設定の `http://127.0.0.1:<port>` のみ許可するオプションで、本番では不要です。リダイレクトには従いません。
 
-結果保存が通信に失敗した場合は `.private/result-*.json` に保持した同一結果を再送します。ジョブ取得時点では回答を一括確保しません。障害後にモデル呼び出しが重複する可能性はありますが、結果確定は処理権とDB更新条件で保護します。
+### 取得と2本の独立worker
+
+- `tick` は非待機のグローバルflockで重複を避け、保存済みoutboxを最大2件再送し、既存の未完了処理を再開します。新規 `/claim` は**1回のtickにつき最大1回・1件**。commonが空なら `quiz.grade` / `document.summarize`、illustrationが空なら `illustration.svg` を同じclaimの候補に入れます。両レーン使用中ならclaimしません。
+- **新規取得のみ日本時間8:00〜23:59**。深夜でも既存処理の再開・結果再送は続けます。HTTP各呼び出しにはDNS・応答本文も含む5秒の制限を設けています。1tickのAPI待ち時間は最大3呼び出し分で、モデル処理はしません。内部タイマー/常駐ポーリングはありません。
+- claimをSQLiteへcommitしてから `start_new_session=True` でworkerを起動します。stdinは `/dev/null`、stdout/stderrはレーン別のprivateログです。tickの正常終了後もworkerが動きます。スケジューラーによる明示的な取消・プロセスツリー強制終了まで防ぐ仕組みではありません。
+- 各workerはレーン別flockを全処理中保持し、1回に1件処理して終了します。commonは既存 `runner.run_model`（`gpt-6-luna / Hermes / openai-codex`、`hermes-jobs-v1`）、illustrationは同関数から既存 `runner.draw_illustration`（`claude-opus-5-5 / Claude Code`、`illustration-v3`）。プロンプト・検証・モデル設定は変更していません。
+- leaseTokenは不透明な文字列としてそのまま保存・送信します。期限切れの未処理claimはモデルを呼ばず `lease_lost` にします。モデル待機時間は既存上限（common150秒、illustration600秒）と残りlease時間の小さい方に制限します。
+- モデルCLIと独立watchdogへレーンのロックFDを継承します。workerがSIGKILLされても生き残るCLIがロックを持つ間は同レーンで再実行しません。watchdogの `/usr/bin/timeout --signal=KILL` が残り時間内にモデルのプロセスグループを終了させ、永久にロックが残ることを避けます。標準のモデルCLIを前提とし、別セッションへ自ら逃げる任意コマンドを扱う設計ではありません。
+
+### 永続化・再送・復旧
+
+- `.private/dispatcher/jobs.sqlite3` はWAL + `synchronous=FULL`。state-dirは0700、DB/ロック/ログは0600。入力・lease・結果を含む機密DBなのでGitへ追加しないでください。バックアップはworker停止後かSQLite backup APIを使用し、稼働中のDB本体だけをコピーしないでください。
+- モデル結果または失敗理由とoutboxを**同じSQLiteトランザクション**で保存してからAPIへ送信します。tickとworkerの送信は別flockで直列化します。通信失敗・HTTP401/429/5xxなどはpendingのまま、次tickで同じ内容を再送します。認証不良は自動修復できないため `status` の `delivery_error` を確認してください。
+- 完了POSTは既存APIの同一結果再送に対応し、remote成功後/local commit前に落ちても再送で回復します。**outboxの完了結果はlease期限後も送信**します（既にremoteで完了していた場合のack回収）。HTTP409は `lease_lost` として終端化し、記録した結果は残します。
+- `/fail` はremote側でleaseを消すため、成功直後にackを失った再送は409になり得ます。この場合も `lease_lost` として保存し、成功と断定しません。APIを変更せずexactly-onceを保証することはできません。
+- 完了POSTがHTTP400（例: UTF-16文字数によるbroker検証拒否）またはHTTP413（リクエスト本文の32KiB超過）の場合は `rejected` として結果を保存し、永久再送でレーンを塞ぎません。remoteのlease期限後、通常のclaim/最大3回の試行制限で再処理されます。結果を黙って修正・削除しません。
+- workerロックが消えた後の `running` は、曖昧なモデル処理をローカルで再実行せず、leaseが有効ならdurableな `fail / runner_error` を送ります。remoteの5分後の再試行と最大3回の制限に委ねます。期限切れなら `lease_lost`。同じremote IDを新leaseで取得した場合も**別attempt**として履歴を残します。
+- claimのremote成功からlocal commitまでのクラッシュ/応答喪失は、現行APIでは完全には閉じられません。その仕事はremoteのlease期限後に再取得可能です。モデル実行のexactly-onceは保証しません。
+- `status` はJSONでattempt・ジョブID・type・状態・実行回数・期限・送信回数/エラーを表示し、入力・結果・leaseToken・認証キーは表示しません。履歴は自動削除しません。ログは `common.log` / `illustration.log`。正常な空tickは無出力でLLMを呼びません。
 
 `hermes-call.py` はローカルHermesの内部Python APIを使います。空のツールセット、ユーザー設定・ルールを無効にした実行です。Hermes更新で内部APIが変われば対応が必要です。Hermes自身の会話保存方針は適用されます。
 
-## このPCの定期設定
+### 旧runnerからの切替
 
-- Hermes cron ID: `6df0ad98fae9` / 「共通LLMジョブ処理」
-- 5分間隔。時間帯はrunnerで日本時間に制限
-- スクリプト: `~/.hermes/scripts/compass-llm-jobs.py`
-- リポジトリ: `/home/kazu/work/hermes-llm-jobs`
-- Codexアプリの旧定期採点 `ai` は停止済み
+1. 旧common・illustration cronを停止し、起動済みrunnerの終了（旧ロックが空くこと）を確認します。旧runnerとdispatcherを同時運用しないでください（ロックは互換ではありません）。
+2. `.private/result-*.json` と `.private/illustration-result-*.json` をバックアップし、旧runnerの再送で解消してから切り替えます。**新dispatcherは旧JSONを自動import/削除しません**。期限切れ・409の未送信結果も必要なら監査用に保管します。ファイルが残る状態で黙って切り替えないでください。
+3. 下記の単一cronへ切り替えます。新設定の検証後、旧illustration cron `507625c90cee` を削除します。`runner.py` と旧ラッパーは変更せず残しています。ロールバックも先に新cronを停止し、worker終了と新outboxの解消を確認してから行います。
 
-登録はHermesの `--script compass-llm-jobs.py --no-agent` を使います。外側のスケジューラーはLLMを呼ばず、runnerが未処理を見つけたときだけHermesを呼びます。`hermes cron runs` で成功・失敗を確認できます。
+### オフラインテスト
+
+```bash
+python3 -m unittest test_dispatcher -v
+```
+
+全テストは一時ディレクトリのSQLite、ループバックHTTPスタブ、偽モデルを使用します。本番API・本番モデル・実際の `.private` DBを使いません。長いillustrationと短いcommonの並行動作、親tick終了、重複tick、空キュー、lease期限、再送/409/400/413、ack直後のクラッシュ、worker死亡後に残るCLI/独立watchdogを検証します。
+
+## このPCの定期設定（切替後）
+
+- Hermes cron ID: `6df0ad98fae9` / 「LLMジョブ取得・振り分け」
+- cron式: `*/3 * * * *`（3分間隔、新規取得の時間帯はdispatcher側で日本時間に制限）
+- スクリプト: `~/.hermes/scripts/llm-job-dispatcher.py` → `dispatcher.py tick`
+- `no_agent=true`、`deliver=local`
+- workdir / リポジトリ: `/home/kazu/work/hermes-llm-jobs`
+- 旧illustration cron `507625c90cee` は切替検証後に削除。Codexアプリの旧定期採点 `ai` は停止済み
+
+外側のスケジューラーはLLMを呼びません。cronの成功は「取得・振り分けが終了した」意味で、非同期workerの完了を意味しません。`hermes cron runs` と `python3 dispatcher.py status` の両方で確認します。コードの導入だけではcron設定を自動変更しません。
 
 ## 移行
 
