@@ -276,6 +276,7 @@ const req = JSON.parse(fs.readFileSync(a[a.indexOf('--input') + 1], 'utf8'));
 const id = a[a.indexOf('--id') + 1];
 fs.writeFileSync(new URL('./argv.txt', import.meta.url), a.join(' '));
 fs.writeFileSync(new URL('./request.txt', import.meta.url), JSON.stringify(req));
+fs.writeFileSync(new URL('./env.txt', import.meta.url), JSON.stringify(process.env));
 const good = { title: 'てすと', subtitle: 'さぶ', seconds: 120, width: 1920, height: 1080, style: 'podcast-duo',
   chapters: [{ t: 0, title: 'イントロ' }, { t: 5, title: 'ひとつめ' }], video: `movies/${id}/video.mp4`, poster: `movies/${id}/poster.webp`, bytes: 1000,
   qa: { status: 'PASS', checks: 18, passed: 18, measuredSec: 120, overlaps: 0, minGapSec: 0.3, lufs: -16, secret: 'dropped' } };
@@ -347,6 +348,20 @@ else if (mode === 'silent') console.log('done, but no result line');
         log = Path(self.tmp.name) / 'private' / 'video-logs' / (self.JID + '.log')
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
         self.assertIn('render 50%', log.read_text())
+
+    def test_make_video_gets_a_minimal_environment_with_a_usable_path(self):
+        root = self.fake_movie()
+        import runner
+        bare = {'PATH': '/usr/bin:/bin', 'HOME': str(Path.home()), 'AWS_SECRET_ACCESS_KEY': 'must-not-leak', 'CLOUDFLARE_API_TOKEN': 'must-not-leak', 'LANG': 'C.UTF-8'}
+        with mock.patch.dict(os.environ, bare, clear=True):
+            runner.make_video(self.job())
+        seen = json.loads((root / 'bin' / 'env.txt').read_text())
+        self.assertNotIn('AWS_SECRET_ACCESS_KEY', seen)
+        self.assertNotIn('CLOUDFLARE_API_TOKEN', seen)
+        self.assertEqual(seen['LANG'], 'C.UTF-8')
+        path = seen['PATH'].split(os.pathsep)
+        self.assertIn(str(Path.home() / '.local/bin'), path, 'claude and node live there')
+        self.assertIn('/usr/bin', path)
 
     def test_make_video_failures_map_to_the_brokers_reasons(self):
         self.fake_movie()

@@ -105,6 +105,9 @@ def make_video(job):
     node=shutil.which('node') or str(Path.home()/'.local/bin/node');main=AUTO_MOVIE/'bin'/'auto-movie.mjs'
     if not main.exists():raise RuntimeError('hermes_failed')
     env={k:v for k,v in os.environ.items() if k in VIDEO_ENV}
+    env.setdefault('HOME',str(Path.home()))
+    # the cron may start us with a bare PATH: the pipeline needs claude and node (~/.local/bin), docker, ffmpeg (/usr/bin)
+    env['PATH']=os.pathsep.join(dict.fromkeys([str(Path.home()/'.local/bin'),os.path.dirname(node),*env.get('PATH','').split(os.pathsep),'/usr/local/bin','/usr/bin','/bin']))
     logs=VIDEO_LOGS;logs.mkdir(mode=0o700,parents=True,exist_ok=True)
     log=logs/(jid+'.log')
     with tempfile.TemporaryDirectory(prefix='hermes-video-') as tmp:
