@@ -54,6 +54,7 @@ python3 provision-app.py my-app --types document.summarize
 | quiz.grade / v1 | question, modelAnswer, rubric（3項目）, answer | criteria（各0〜2点と理由）, confidence, feedback |
 | document.summarize / v1 | text（最大12,000文字） | summary, keyPoints |
 | illustration.svg / v1 | subject（最大60文字、記号 `<>{}` などなし） | svg（線画のSVG、24,000文字まで）, memo（描き手の設計メモ、任意） |
+| video.generate / v1 | theme（最大60文字、記号 `<>{}` などなし）, minutes（2 か 3）, notes（任意、最大1,500文字） | title, subtitle, seconds, width, height, style, chapters（2〜16個）, video / poster（R2 のキー）, bytes, qa（任意） |
 
 HTTP本文は最大32KiBです。採点基準の文字列などにも個別上限があります。APIの入力・結果形式を `worker.js`、Hermesへの指示・結果検証を `runner.py` で管理しています。任意のコマンド・URL・プロンプトをイベント入力で実行する機能はありません。
 
@@ -66,6 +67,17 @@ HTTP本文は最大32KiBです。採点基準の文字列などにも個別上�
 - 題材は訪問者が入力した信頼できない文字列として、固定のプロンプトに差し込むだけです。結果のSVGは [svgclean.py](svgclean.py) の許可リスト（要素・属性・`url(#id)` のみ）で作り直し、先頭のコメントを memo として切り出します。Worker でも最後に危険な記述がないか確かめます。
 - 処理権の期限は1,200秒（ほかは600秒）、Claude の呼び出しは600秒で打ち切ります。1アプリあたり1日30件まで（UTC日、日本時間9時に戻る）。同じ重複防止キーの再送は数えません。
 - 1枚あたり3分ほど、Claude の利用枠を使います（API換算で0.4ドル前後）。
+
+## 動画（video.generate）
+
+テーマと長さ（2分か3分）、使ってほしい事実（任意）から、二人の掛け合いの解説動画を1本つくります。demos の `auto_movie` ページの「つくる」が使っています。つくるのは [demos/auto_movie](../demos/auto_movie)（Claude が台本と絵を書き、VOICEVOX が読み上げ、HyperFrames が書き出す）で、ふつう10〜15分、Claude の利用枠を API 換算で1.6ドルほど使います。
+
+- 実行は3本目のレーン `video` です（専用のファイルロック、cron は共通の1本のまま）。`runner.make_video` が `node auto_movie/bin/auto-movie.mjs job --input <一時ファイル> --id <ジョブID>` を起動します。訪問者の文字列は**JSONファイルで渡し、コマンドライン引数には出しません**。環境変数は許可リスト（HOME、PATH など）だけです。ログは `.private/video-logs/<ジョブID>.log`（所有者限定）。
+- auto_movie は入力を再検査し、絵を許可リストで作り直し、完成した軽量版（1080p）とポスターを R2 のバケット `demos-media` の `movies/<ジョブID>/video.mp4` と `poster.webp` に上げます。**結果の JSON にはこの2つのキーだけが入り、ブローカーも runner も「そのジョブ自身のID」以外を含む結果を拒否します**（他のジョブや任意の URL は指せません）。動画のファイルそのものは D1 に入りません。
+- 処理権の期限は2,700秒、runner の打ち切りは2,400秒（`VIDEO_TIMEOUT`）。1アプリあたり1日3本まで（UTC日、日本時間9時に戻る）。同じ重複防止キーの再送は数えません。失敗の再試行（最大3回）では、実行ディレクトリに残した台本・絵・LLM の応答が使われるので、やり直しの費用はほとんどかかりません。
+- テーマが不適切だとモデルが判断すると `job` が終了コード3で終わり、runner は `invalid_result` として失敗にします。入力が不正なら終了コード2で、同じく `invalid_result` です（再試行しても変わりません）。
+- 動作は `AUTO_MOVIE_DIR` で別の場所に向けられます（既定は `~/work/demos/auto_movie`、そこでチェックアウトされているブランチのコードが動きます）。auto_movie 側は R2 へのアップロードに、demos リポジトリの `wrangler` のログインを使います。
+- 確認は `node smoke-video.mjs`。使い捨てのローカルDBとローカルのブローカーを自分で立てて、登録・重複・上限・処理権・結果の検証・他アプリからの閲覧拒否・失敗の差し戻し、そして実物の dispatcher と worker（auto_movie の代役つき）までを通します。本番には触りません。
 
 ## 新しい処理の種類を追加する手順
 
@@ -311,17 +323,18 @@ python3 dispatcher.py status
 # 通常はtickが起動。手動の再開・診断時にも同じロックを使用する
 python3 dispatcher.py worker --lane illustration
 python3 dispatcher.py worker --lane common
+python3 dispatcher.py worker --lane video
 ```
 
 全サブコマンドに `--state-dir /absolute/private/directory` と `--config /absolute/config.json` を指定できます。既定は `.private/dispatcher` と `.private/config.json`。同一PCの全tick/workerで**同じstate-dir**を使用してください。`status` はAPIや設定ファイルを読みません。`--allow-loopback` は明示的なテスト用設定の `http://127.0.0.1:<port>` のみ許可するオプションで、本番では不要です。リダイレクトには従いません。
 
-### 取得と2本の独立worker
+### 取得と3本の独立worker
 
-- `tick` は非待機のグローバルflockで重複を避け、保存済みoutboxを最大2件再送し、既存の未完了処理を再開します。新規 `/claim` は**1回のtickにつき最大1回・1件**。commonが空なら `quiz.grade` / `document.summarize`、illustrationが空なら `illustration.svg` を同じclaimの候補に入れます。両レーン使用中ならclaimしません。
+- `tick` は非待機のグローバルflockで重複を避け、保存済みoutboxを最大2件再送し、既存の未完了処理を再開します。新規 `/claim` は**1回のtickにつき最大1回・1件**。commonが空なら `quiz.grade` / `document.summarize`、illustrationが空なら `illustration.svg`、videoが空なら `video.generate` を同じclaimの候補に入れます。全レーン使用中ならclaimしません。動画は10分以上かかりますが、専用レーンなので採点とイラストは待たされません。
 - **新規取得のみ日本時間8:00〜23:59**。深夜でも既存処理の再開・結果再送は続けます。HTTP各呼び出しにはDNS・応答本文も含む5秒の制限を設けています。1tickのAPI待ち時間は最大3呼び出し分で、モデル処理はしません。内部タイマー/常駐ポーリングはありません。
 - claimをSQLiteへcommitしてから `start_new_session=True` でworkerを起動します。stdinは `/dev/null`、stdout/stderrはレーン別のprivateログです。tickの正常終了後もworkerが動きます。スケジューラーによる明示的な取消・プロセスツリー強制終了まで防ぐ仕組みではありません。
-- 各workerはレーン別flockを全処理中保持し、1回に1件処理して終了します。commonは既存 `runner.run_model`（`gpt-6-luna / Hermes / openai-codex`、`hermes-jobs-v1`）、illustrationは同関数から既存 `runner.draw_illustration`（`claude-opus-5-5 / Claude Code`、`illustration-v3`）。プロンプト・検証・モデル設定は変更していません。
-- leaseTokenは不透明な文字列としてそのまま保存・送信します。期限切れの未処理claimはモデルを呼ばず `lease_lost` にします。モデル待機時間は既存上限（common150秒、illustration600秒）と残りlease時間の小さい方に制限します。
+- 各workerはレーン別flockを全処理中保持し、1回に1件処理して終了します。commonは既存 `runner.run_model`（`gpt-6-luna / Hermes / openai-codex`、`hermes-jobs-v1`）、illustrationは同関数から既存 `runner.draw_illustration`（`claude-opus-5-5 / Claude Code`、`illustration-v3`）、videoは `runner.make_video`（`claude-opus-5-5 / VOICEVOX / HyperFrames`、`auto-movie-v1`）。プロンプト・検証・モデル設定は変更していません。
+- leaseTokenは不透明な文字列としてそのまま保存・送信します。期限切れの未処理claimはモデルを呼ばず `lease_lost` にします。モデル待機時間は既存上限（common150秒、illustration600秒、video2,400秒）と残りlease時間の小さい方に制限します。
 - モデルCLIと独立watchdogへレーンのロックFDを継承します。workerがSIGKILLされても生き残るCLIがロックを持つ間は同レーンで再実行しません。watchdogの `/usr/bin/timeout --signal=KILL` が残り時間内にモデルのプロセスグループを終了させ、永久にロックが残ることを避けます。標準のモデルCLIを前提とし、別セッションへ自ら逃げる任意コマンドを扱う設計ではありません。
 
 ### 永続化・再送・復旧
@@ -333,7 +346,7 @@ python3 dispatcher.py worker --lane common
 - 完了POSTがHTTP400（例: UTF-16文字数によるbroker検証拒否）またはHTTP413（リクエスト本文の32KiB超過）の場合は `rejected` として結果を保存し、永久再送でレーンを塞ぎません。remoteのlease期限後、通常のclaim/最大3回の試行制限で再処理されます。結果を黙って修正・削除しません。
 - workerロックが消えた後の `running` は、曖昧なモデル処理をローカルで再実行せず、leaseが有効ならdurableな `fail / runner_error` を送ります。remoteの5分後の再試行と最大3回の制限に委ねます。期限切れなら `lease_lost`。同じremote IDを新leaseで取得した場合も**別attempt**として履歴を残します。
 - claimのremote成功からlocal commitまでのクラッシュ/応答喪失は、現行APIでは完全には閉じられません。その仕事はremoteのlease期限後に再取得可能です。モデル実行のexactly-onceは保証しません。
-- `status` はJSONでattempt・ジョブID・type・状態・実行回数・期限・送信回数/エラーを表示し、入力・結果・leaseToken・認証キーは表示しません。履歴は自動削除しません。ログは `common.log` / `illustration.log`。正常な空tickは無出力でLLMを呼びません。
+- `status` はJSONでattempt・ジョブID・type・状態・実行回数・期限・送信回数/エラーを表示し、入力・結果・leaseToken・認証キーは表示しません。履歴は自動削除しません。ログは `common.log` / `illustration.log` / `video.log`。正常な空tickは無出力でLLMを呼びません。
 
 `hermes-call.py` はローカルHermesの内部Python APIを使います。空のツールセット、ユーザー設定・ルールを無効にした実行です。Hermes更新で内部APIが変われば対応が必要です。Hermes自身の会話保存方針は適用されます。
 

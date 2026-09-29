@@ -21,7 +21,13 @@ from zoneinfo import ZoneInfo
 
 import runner
 
-LANES = {'common': tuple(runner.TYPES), 'illustration': (runner.ILLUSTRATION,)}
+LANES = {'common': tuple(runner.TYPES), 'illustration': (runner.ILLUSTRATION,), 'video': (runner.VIDEO,)}
+# seconds one model call may take, per event type (the default is the common lane's 150)
+BUDGET = {runner.ILLUSTRATION: 600, runner.VIDEO: runner.VIDEO_TIMEOUT}
+# what the broker records next to each result, per lane
+META = {'common': (runner.MODEL + ' / Hermes / openai-codex', runner.VERSION),
+        'illustration': (runner.ILLUSTRATION_MODEL + ' / Claude Code', runner.ILLUSTRATION_VERSION),
+        'video': (runner.VIDEO_MODEL, runner.VIDEO_VERSION)}
 JST = ZoneInfo('Asia/Tokyo')
 API_TIMEOUT = 5
 
@@ -92,8 +98,7 @@ def execute_model(job, lane_fd):
     deadline = time.monotonic() + max(0, job['lease_until'] - time.time())
     class LeaseProcess(subprocess.Popen):
         def __init__(self, *args, **kwargs):
-            budget = min(600 if job['type'] == runner.ILLUSTRATION else 150,
-                         deadline - time.monotonic())
+            budget = min(BUDGET.get(job['type'], 150), deadline - time.monotonic())
             if budget <= 0:
                 raise TimeoutError('lease_expired')
             kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), lane_fd)
@@ -110,7 +115,7 @@ def execute_model(job, lane_fd):
 
     original = runner.subprocess
     runner.subprocess = SimpleNamespace(Popen=LeaseProcess, PIPE=subprocess.PIPE,
-        DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired)
+        DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT, TimeoutExpired=subprocess.TimeoutExpired)
     try:
         if time.monotonic() >= deadline:
             raise TimeoutError('lease_expired')
@@ -145,12 +150,8 @@ def worker(store, api, lane, model=None):
                     reason = 'model_timeout' if isinstance(exc, TimeoutError) else 'invalid_result' if isinstance(exc, (ValueError, KeyError)) else 'hermes_failed'
                     store.record(attempt, 'fail', {'reason': reason})
                 else:
-                    illustration = lane == 'illustration'
-                    store.record(attempt, 'complete', {
-                        'result': result,
-                        'model': runner.ILLUSTRATION_MODEL + ' / Claude Code' if illustration else runner.MODEL + ' / Hermes / openai-codex',
-                        'promptVersion': runner.ILLUSTRATION_VERSION if illustration else runner.VERSION,
-                    })
+                    label, version = META[lane]
+                    store.record(attempt, 'complete', {'result': result, 'model': label, 'promptVersion': version})
         store.flush(api, lane)
 
 

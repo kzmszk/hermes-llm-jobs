@@ -89,18 +89,19 @@ class DispatcherTests(BaseTest):
         with d.Store(self.private) as store:
             def api(path, body):
                 calls.append((path, body))
-                return {'job': self.job('art', 'illustration.svg') if len(calls) == 1 else self.job('text')}
+                return {'job': self.job('art', 'illustration.svg') if len(calls) == 1 else self.job('text') if len(calls) == 2 else None}
             def spawn(lane):
                 self.assertTrue(any(r['lane'] == lane and r['state'] == 'queued' for r in store.status()))
                 spawned.append(lane)
             day = datetime.datetime(2026, 1, 1, 12, tzinfo=d.JST)
             d.tick(store, api, spawn, now=day)
             self.assertEqual(len(calls), 1)
-            self.assertEqual(set(calls[0][1]['types']), {'quiz.grade', 'document.summarize', 'illustration.svg'})
+            self.assertEqual(set(calls[0][1]['types']), {'quiz.grade', 'document.summarize', 'illustration.svg', 'video.generate'})
             d.tick(store, api, spawn, now=day)
-            self.assertEqual(calls[1][1]['types'], ['quiz.grade', 'document.summarize'])
+            self.assertEqual(calls[1][1]['types'], ['quiz.grade', 'document.summarize', 'video.generate'])
             d.tick(store, api, spawn, now=day)
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[2][1]['types'], ['video.generate'], 'with grading and drawing busy only the video lane is still open')
+            self.assertEqual(len(calls), 3)
             self.assertEqual(len(store.status()), 2)
 
     def test_worker_records_result_before_send_with_pinned_metadata(self):
@@ -264,6 +265,136 @@ class DispatcherTests(BaseTest):
             self.assertIn('document.summarize', claims[0]['types'])
             self.assertEqual(store.status()[0]['delivery_error'], 'http_413')
             self.assertEqual(store.status()[0]['delivery_tries'], 1)
+
+
+class VideoTests(BaseTest):
+    """video.generate: its own lane, its own budget and labels, and a runner that hands a visitor's text over as a file."""
+    FAKE = r"""
+import fs from 'node:fs';
+const a = process.argv.slice(2);
+const req = JSON.parse(fs.readFileSync(a[a.indexOf('--input') + 1], 'utf8'));
+const id = a[a.indexOf('--id') + 1];
+fs.writeFileSync(new URL('./argv.txt', import.meta.url), a.join(' '));
+fs.writeFileSync(new URL('./request.txt', import.meta.url), JSON.stringify(req));
+const good = { title: 'てすと', subtitle: 'さぶ', seconds: 120, width: 1920, height: 1080, style: 'podcast-duo',
+  chapters: [{ t: 0, title: 'イントロ' }, { t: 5, title: 'ひとつめ' }], video: `movies/${id}/video.mp4`, poster: `movies/${id}/poster.webp`, bytes: 1000,
+  qa: { status: 'PASS', checks: 18, passed: 18, measuredSec: 120, overlaps: 0, minGapSec: 0.3, lufs: -16, secret: 'dropped' } };
+console.log('render 50%');
+const mode = req.theme.split(' ')[0];
+if (mode === 'ok') console.log('AUTO_MOVIE_RESULT ' + JSON.stringify(good));
+else if (mode === 'reject') { console.error('theme_rejected'); process.exit(3); }
+else if (mode === 'crash') process.exit(1);
+else if (mode === 'hang') setTimeout(() => {}, 60000);
+else if (mode === 'badjson') console.log('AUTO_MOVIE_RESULT {nope');
+else if (mode === 'foreign') console.log('AUTO_MOVIE_RESULT ' + JSON.stringify({ ...good, video: 'movies/someone-else/video.mp4' }));
+else if (mode === 'silent') console.log('done, but no result line');
+"""
+    JID = 'abcd1234-ef56-4789-a012-345678901234'
+
+    def fake_movie(self, name='fake'):
+        root = Path(self.tmp.name) / name
+        (root / 'bin').mkdir(parents=True)
+        (root / 'bin' / 'auto-movie.mjs').write_text(self.FAKE)
+        import runner
+        mock.patch.object(runner, 'AUTO_MOVIE', root).start()
+        mock.patch.object(runner, 'PRIVATE', Path(self.tmp.name) / 'private').start()
+        mock.patch.object(runner, 'VIDEO_LOGS', Path(self.tmp.name) / 'private' / 'video-logs').start()
+        return root
+
+    def job(self, theme='ok computer', **extra):
+        return {'id': self.JID, 'type': 'video.generate', 'version': 1, 'payload': {'theme': theme, 'minutes': 2, **extra},
+                'leaseToken': 'opaque', 'lease_until': time.time() + 3000}
+
+    def test_video_has_its_own_lane_budget_and_labels(self):
+        d = self.module()
+        self.assertEqual(d.lane_for('video.generate'), 'video')
+        self.assertIn('video.generate', d.LANES['video'])
+        self.assertNotIn('video.generate', d.LANES['common'])
+        self.assertEqual(d.BUDGET['video.generate'], d.runner.VIDEO_TIMEOUT)
+        self.assertLess(d.runner.VIDEO_TIMEOUT, 2700, 'shorter than the broker lease')
+        with d.Store(self.private) as store:
+            attempt = store.save_claim(self.job())
+            sent = []
+            d.worker(store, lambda path, body: sent.append((path, body)), 'video', model=lambda job, fd: {'ok': True})
+            self.assertEqual(store.get(attempt)['state'], 'completed')
+            self.assertEqual(sent[0][1]['model'], 'claude-opus-5-5 / VOICEVOX / HyperFrames')
+            self.assertEqual(sent[0][1]['promptVersion'], 'auto-movie-v1')
+
+    def test_a_running_video_does_not_hold_up_grading_or_drawing(self):
+        import datetime
+        d = self.module()
+        with d.Store(self.private) as store, d.lock(self.private, 'video') as held:
+            self.assertIsNotNone(held)
+            calls = []
+            def api(path, body):
+                calls.append(body)
+                return {'job': None}
+            d.tick(store, api, lambda lane: None, now=datetime.datetime(2026, 1, 1, 12, tzinfo=d.JST))
+            self.assertEqual(set(calls[0]['types']), {'quiz.grade', 'document.summarize', 'illustration.svg'})
+
+    def test_make_video_hands_text_over_as_a_file_and_returns_only_known_fields(self):
+        root = self.fake_movie()
+        import runner
+        theme = "ok ' ; rm -rf ~ $(reboot) \u3042"
+        result = runner.make_video(self.job(theme, notes='数字は\nそのまま使う'))
+        self.assertEqual(result['video'], 'movies/%s/video.mp4' % self.JID)
+        self.assertEqual(result['poster'], 'movies/%s/poster.webp' % self.JID)
+        self.assertEqual(result['qa'], {'status': 'PASS', 'checks': 18, 'passed': 18, 'measuredSec': 120, 'overlaps': 0, 'minGapSec': 0.3, 'lufs': -16})
+        self.assertEqual(result['chapters'], [{'t': 0, 'title': 'イントロ'}, {'t': 5, 'title': 'ひとつめ'}])
+        argv = (root / 'bin' / 'argv.txt').read_text()
+        self.assertNotIn('rm -rf', argv, 'the visitor\'s text never appears in the command line')
+        self.assertEqual(json.loads((root / 'bin' / 'request.txt').read_text()), {'theme': theme, 'minutes': 2, 'notes': '数字は\nそのまま使う'})
+        log = Path(self.tmp.name) / 'private' / 'video-logs' / (self.JID + '.log')
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        self.assertIn('render 50%', log.read_text())
+
+    def test_make_video_failures_map_to_the_brokers_reasons(self):
+        self.fake_movie()
+        import runner
+        with self.assertRaises(ValueError):                # the model declined the theme: retrying will not help
+            runner.make_video(self.job('reject this'))
+        with self.assertRaises(RuntimeError):
+            runner.make_video(self.job('crash now'))
+        with self.assertRaises(RuntimeError):
+            runner.make_video(self.job('silent run'))
+        with self.assertRaises(ValueError):
+            runner.make_video(self.job('badjson please'))
+        with self.assertRaises(ValueError):                # pointing at somebody else's files is refused
+            runner.make_video(self.job('foreign files'))
+
+    def test_make_video_stops_a_hung_run(self):
+        self.fake_movie()
+        import runner
+        mock.patch.object(runner, 'VIDEO_TIMEOUT', 1).start()
+        start = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            runner.make_video(self.job('hang forever'))
+        self.assertLess(time.monotonic() - start, 6)
+
+    def test_make_video_rejects_bad_requests_before_starting_anything(self):
+        root = self.fake_movie()
+        import runner
+        for bad in (dict(theme=''), dict(theme='x' * 61), dict(theme='a<b'), dict(theme='ok', minutes=9), dict(theme='ok', notes=5), dict(theme='ok', notes='x' * 1501)):
+            job = self.job()
+            job['payload'].update(bad)
+            with self.assertRaises(ValueError):
+                runner.make_video(job)
+        job = self.job()
+        job['id'] = '../../etc'
+        with self.assertRaises(ValueError):
+            runner.make_video(job)
+        self.assertFalse((root / 'bin' / 'argv.txt').exists(), 'nothing was started')
+
+    def test_video_result_rules(self):
+        import runner
+        good = {'title': 't', 'subtitle': 's', 'seconds': 100, 'width': 1920, 'height': 1080, 'style': 'monologue', 'bytes': 5,
+                'video': 'movies/j/video.mp4', 'poster': 'movies/j/poster.webp', 'chapters': [{'t': 0, 'title': 'a'}, {'t': 3.5, 'title': 'b'}]}
+        self.assertEqual(runner.validate_video(good, 'j')['seconds'], 100)
+        for key, value in [('title', ''), ('seconds', 5), ('seconds', True), ('width', 1920.5), ('style', 'other'), ('bytes', 0), ('video', 'movies/x/video.mp4'),
+                           ('poster', 'https://evil.example/p.webp'), ('chapters', [{'t': 0, 'title': 'a'}]), ('chapters', [{'t': 5, 'title': 'a'}, {'t': 5, 'title': 'b'}]),
+                           ('chapters', [{'t': i, 'title': 'x'} for i in range(17)]), ('qa', {'status': 'FAIL', 'checks': 1, 'passed': 0})]:
+            with self.assertRaises(ValueError, msg=(key, value)):
+                runner.validate_video(dict(good, **{key: value}), 'j')
 
 
 class SubprocessTests(BaseTest):

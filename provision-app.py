@@ -3,7 +3,7 @@
 import argparse, hashlib, json, os, re, secrets, subprocess, tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
-p=argparse.ArgumentParser();p.add_argument('app');p.add_argument('--types',nargs='+',choices=['quiz.grade','document.summarize','illustration.svg'],required=True);args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('app');p.add_argument('--types',nargs='+',choices=['quiz.grade','document.summarize','illustration.svg','video.generate'],required=True);args=p.parse_args()
 if not re.fullmatch('[a-z0-9-]{1,60}',args.app):p.error('Use an app ID containing lowercase letters, digits, and hyphens.')
 private=ROOT/'.private/apps';private.mkdir(parents=True,exist_ok=True,mode=0o700)
 key=secrets.token_hex(32);digest=hashlib.sha256(key.encode()).hexdigest()

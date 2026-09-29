@@ -1,8 +1,9 @@
 // Standalone job broker. No quiz database or application-specific side effects.
 import { body, equal, fail, hash, json, now, randomToken, limit } from './http.js';
-const TYPES = ['quiz.grade', 'document.summarize', 'illustration.svg'];
-const ILLUSTRATIONS_PER_DAY = 30;     // per app, counted per UTC day (resets 09:00 JST)
-const LEASE = { 'illustration.svg': 1200 };   // seconds; everything else keeps 600
+const TYPES = ['quiz.grade', 'document.summarize', 'illustration.svg', 'video.generate'];
+// Per app and per UTC day (resets 09:00 JST). A video takes about ten minutes of the PC and a few dollars of Claude usage, so the allowance is small.
+const DAILY = { 'illustration.svg': [30, '今日のイラストの受付は終わりました。'], 'video.generate': [3, '今日の動画の受付は終わりました。'] };
+const LEASE = { 'illustration.svg': 1200, 'video.generate': 2700 };   // seconds; everything else keeps 600
 const str = (x, n) => typeof x === 'string' && x.trim().length > 0 && x.length <= n;
 // The runner sanitizes the SVG against an allow-list; this is the broker's own last check.
 const UNSAFE_SVG = /<script|<foreignObject|<iframe|<image|<a[\s>]|<!|<\?|\son[a-z]+\s*=|javascript:|data:|url\((?!#)/i;
@@ -16,10 +17,19 @@ function input(type, p) {
     if (!str(p.subject,60) || /[\u0000-\u001f\u007f<>{}`\\]/.test(p.subject)) fail(400,'subject（60文字まで、記号 <>{}`\\ なし）が必要です。');
     return { subject:p.subject.trim() };
   }
+  if (type === 'video.generate') {
+    // theme and notes are typed by a visitor: the runner treats them as untrusted text
+    if (!str(p.theme,60) || /[\u0000-\u001f\u007f<>{}`\\]/.test(p.theme)) fail(400,'theme（60文字まで、記号 <>{}`\\ なし）が必要です。');
+    if (p.minutes !== 2 && p.minutes !== 3) fail(400,'minutes（2か3）が必要です。');
+    if (p.notes != null && (typeof p.notes !== 'string' || p.notes.length > 1500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(p.notes))) fail(400,'notes（1,500文字まで）の形式が不正です。');
+    return p.notes && p.notes.trim() ? { theme:p.theme.trim(), minutes:p.minutes, notes:p.notes.trim() } : { theme:p.theme.trim(), minutes:p.minutes };
+  }
   if (!str(p.text,12000)) fail(400,'要約するtextが必要です（最大12,000文字）。');
   return { text:p.text };
 }
-function output(type, r) {
+const num = (x, lo, hi) => Number.isFinite(x) && x >= lo && x <= hi;
+const int = (x, lo, hi) => Number.isInteger(x) && x >= lo && x <= hi;
+function output(type, r, id) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) fail(400,'resultが必要です。');
   if (type === 'quiz.grade') {
     if (!Array.isArray(r.criteria) || r.criteria.length!==3 || r.criteria.some((x,i)=>x.index!==i || !Number.isInteger(x.points) || x.points<0 || x.points>2 || !str(x.feedback,1000)) || !Number.isFinite(r.confidence) || r.confidence<0 || r.confidence>1 || !str(r.feedback,2500)) fail(400,'採点結果の形式が不正です。');
@@ -29,6 +39,21 @@ function output(type, r) {
     if (!str(r.svg,24000) || !/^<svg[\s>]/.test(r.svg) || !/<\/svg>\s*$/.test(r.svg) || UNSAFE_SVG.test(r.svg)) fail(400,'SVGの形式が不正です。');
     if (r.memo != null && !str(r.memo,1000)) fail(400,'メモの形式が不正です。');
     return r.memo ? { svg:r.svg,memo:r.memo } : { svg:r.svg };
+  }
+  if (type === 'video.generate') {
+    // The files live in R2 under this job's own id (the Worker of the app serves /media/movies/<id>/…); nothing else can be pointed at.
+    const ch = r.chapters;
+    if (!str(r.title,60) || !str(r.subtitle,80) || !num(r.seconds,20,400) || !int(r.width,640,3840) || !int(r.height,360,2160) || !['podcast-duo','monologue','entertainment'].includes(r.style)
+      || r.video !== `movies/${id}/video.mp4` || r.poster !== `movies/${id}/poster.webp` || !int(r.bytes,1,200*1024*1024)
+      || !Array.isArray(ch) || ch.length < 2 || ch.length > 16 || ch.some((c,i) => !c || typeof c !== 'object' || !num(c.t,0,400) || !str(c.title,60) || (i && c.t <= ch[i-1].t))) fail(400,'動画の結果の形式が不正です。');
+    const out = { title:r.title, subtitle:r.subtitle, seconds:r.seconds, width:r.width, height:r.height, style:r.style, chapters:ch.map(({t,title}) => ({t,title})), video:r.video, poster:r.poster, bytes:r.bytes };
+    const q = r.qa;
+    if (q != null) {
+      if (typeof q !== 'object' || Array.isArray(q) || !['PASS','WARN'].includes(q.status) || !int(q.checks,0,99) || !int(q.passed,0,99)
+        || (q.measuredSec != null && !num(q.measuredSec,0,400)) || (q.overlaps != null && !int(q.overlaps,0,999)) || (q.minGapSec != null && !num(q.minGapSec,0,60)) || (q.lufs != null && !num(q.lufs,-70,0))) fail(400,'動画の検査結果の形式が不正です。');
+      out.qa = Object.fromEntries(['status','checks','passed','measuredSec','overlaps','minGapSec','lufs'].filter(k => q[k] != null).map(k => [k,q[k]]));
+    }
+    return out;
   }
   if (!str(r.summary,4000) || !Array.isArray(r.keyPoints) || r.keyPoints.length>8 || r.keyPoints.some(x=>!str(x,500))) fail(400,'要約結果の形式が不正です。');
   return { summary:r.summary,keyPoints:r.keyPoints };
@@ -53,12 +78,13 @@ export async function jobRoute(request, env) {
     const d=await body(request);
     if (!TYPES.includes(d.type) || !JSON.parse(app.allowed_types).includes(d.type) || d.version!==1 || !str(d.idempotencyKey,160)) fail(400,'イベント種別・バージョン・重複防止キーを確認してください。');
     const payload=input(d.type,d.payload), fingerprint=await hash(JSON.stringify({type:d.type,version:1,payload})), id=crypto.randomUUID();
-    if (d.type==='illustration.svg') {
+    if (DAILY[d.type]) {
       // A resent request (same key and input) returns its job without spending the daily allowance.
       const seen=await env.DB.prepare('SELECT id,input_hash,status FROM llm_jobs WHERE app_id=? AND idempotency_key=?').bind(app.id,d.idempotencyKey).first();
       if (seen) { if(seen.input_hash!==fingerprint)fail(409,'同じキーで異なる内容は登録できません。'); return json({id:seen.id,status:seen.status}); }
-      try { await limit(env,'daily:'+app.id+':illustration.svg',ILLUSTRATIONS_PER_DAY,86400); }
-      catch (e) { if (e.status===429) fail(429,'今日のイラストの受付は終わりました。','daily_limit'); throw e; }
+      const [max,message]=DAILY[d.type];
+      try { await limit(env,'daily:'+app.id+':'+d.type,max,86400); }
+      catch (e) { if (e.status===429) fail(429,message,'daily_limit'); throw e; }
     }
     await env.DB.prepare("INSERT INTO llm_jobs(id,app_id,type,version,idempotency_key,input_hash,payload_json,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,idempotency_key) DO NOTHING").bind(id,app.id,d.type,1,d.idempotencyKey,fingerprint,JSON.stringify(payload),time,time,time).run();
     const row=await env.DB.prepare('SELECT id,input_hash,status FROM llm_jobs WHERE app_id=? AND idempotency_key=?').bind(app.id,d.idempotencyKey).first();
@@ -92,7 +118,7 @@ export async function jobRoute(request, env) {
       return json({ok:true});
     }
     if(!str(d.model,200) || !str(d.promptVersion,100))fail(400,'モデル名と指示の版が必要です。');
-    const result={...output(row.type,d.result),model:d.model,promptVersion:d.promptVersion}, resultJSON=JSON.stringify(result), digest=await hash(resultJSON);
+    const result={...output(row.type,d.result,row.id),model:d.model,promptVersion:d.promptVersion}, resultJSON=JSON.stringify(result), digest=await hash(resultJSON);
     if(row.status==='completed') {if(row.result_hash!==digest)fail(409,'保存済みの結果と異なります。');return json({ok:true,duplicate:true});}
     if(row.status!=='running'||row.lease_until<=time)fail(409,'処理権が失効しました。');
     const saved=await env.DB.batch([
